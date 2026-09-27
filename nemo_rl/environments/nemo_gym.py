@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Coroutine, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
@@ -57,8 +57,11 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.gym_checkpoint import (
     GYM_AGENT_CONTINUATION_INDEX_FEATURE,
+    GYM_AGENT_COMPLETION_BULK_ACK_FEATURE,
+    GYM_AGENT_COMPLETION_BULK_ACK_MAX_RECEIPTS,
+    GYM_AGENT_COMPLETION_BULK_ACK_PATH,
     GYM_AGENT_COMPLETION_ACK_PATH,
-    GYM_AGENT_COMPLETION_RECEIPT_PATH,
+    GYM_AGENT_INLINE_COMPLETION_RECEIPT_FEATURE,
     GYM_AGENT_CHECKPOINT_PREFIX,
     GYM_AGENT_DISCARD_RESTORED_CONTINUATION_PATH,
     GYM_CHECKPOINT_CAPABILITIES_PATH,
@@ -85,6 +88,8 @@ from nemo_rl.environments.gym_checkpoint import (
     GymCheckpointTopology,
     GymCompletionReceipt,
     GymCompletedExecution,
+    GymCompletedExecutionAcknowledgementBatchRequest,
+    GymCompletedExecutionAcknowledgementBatchResponse,
     GymCompletedExecutionAcknowledgementResponse,
     GymCoordinatorModelStatusResponse,
     GymControlCapabilities,
@@ -109,6 +114,7 @@ from nemo_rl.environments.gym_checkpoint import (
     GymSingleWorkerModelStatusResponse,
     GymWorkerAcknowledgements,
     gym_capture_key,
+    gym_completion_acknowledgement_batch_digest,
     gym_generation_cut_receipts,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -689,6 +695,13 @@ class NemoGym(EnvironmentInterface):
         from nemo_gym.server_utils import HEAD_SERVER_KEY_NAME, BaseServerConfig
         from omegaconf import DictConfig
 
+        if not hasattr(RolloutCollectionHelper, "run_examples_with_metadata"):
+            raise RuntimeError(
+                "installed NeMo-Gym does not provide "
+                "RolloutCollectionHelper.run_examples_with_metadata; update the "
+                "Gym dependency to the checkpoint-scale-compatible revision"
+            )
+
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
         assert __file__.endswith(RELATIVE_PATH)
 
@@ -734,8 +747,15 @@ class NemoGym(EnvironmentInterface):
             "global_aiohttp_connector_limit_per_host", 16_384
         )
         initial_global_config_dict.setdefault("global_aiohttp_connector_limit", 65_536)
+        initial_global_config_dict.setdefault(
+            "global_aiohttp_control_connector_limit_per_host", 64
+        )
+        initial_global_config_dict.setdefault(
+            "global_aiohttp_control_connector_limit", 256
+        )
         print(
             f"""Set global_aiohttp_connector_limit_per_host={initial_global_config_dict["global_aiohttp_connector_limit_per_host"]} and global_aiohttp_connector_limit={initial_global_config_dict["global_aiohttp_connector_limit"]}.
+Reserved control-plane connector capacity: limit_per_host={initial_global_config_dict["global_aiohttp_control_connector_limit_per_host"]}, limit={initial_global_config_dict["global_aiohttp_control_connector_limit"]}.
 Depending on your data shape, you may want to change these values."""
         )
 
@@ -891,22 +911,37 @@ Depending on your data shape, you may want to change these values."""
         )
         headers = {**kwargs.pop("headers", {}), **default_headers}
         request_timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
-        try:
-            response = await asyncio.wait_for(
-                self._control_client().request(
-                    server_name=server_name,
-                    url_path=path,
-                    method=method,
-                    headers=headers,
-                    **kwargs,
-                ),
-                timeout=request_timeout_s,
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"Gym control call to {server_name!r} {method} {path} exceeded "
-                f"{request_timeout_s}s (control plane unreachable or stalled)"
-            ) from None
+        retryable_transport = (
+            method == "POST" and path == GYM_AGENT_COMPLETION_BULK_ACK_PATH
+        )
+        max_attempts = 3 if retryable_transport else 1
+        attempt_timeout_s = (
+            min(request_timeout_s, 15.0) if retryable_transport else request_timeout_s
+        )
+        response = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await asyncio.wait_for(
+                    self._control_client().request(
+                        server_name=server_name,
+                        url_path=path,
+                        method=method,
+                        traffic_class="control",
+                        headers=headers,
+                        **kwargs,
+                    ),
+                    timeout=attempt_timeout_s,
+                )
+                break
+            except asyncio.TimeoutError:
+                if attempt == max_attempts:
+                    raise RuntimeError(
+                        f"Gym control call to {server_name!r} {method} {path} "
+                        f"timed out after {max_attempts} attempt(s) of "
+                        f"{attempt_timeout_s}s (control plane unreachable or stalled)"
+                    ) from None
+                await asyncio.sleep(0.25 * attempt)
+        assert response is not None
         if response.status != 200:
             response_text = await response.text()
             error_code: Optional[str] = None
@@ -1044,26 +1079,6 @@ Depending on your data shape, you may want to change these values."""
             )
         return participant
 
-    async def _completion_receipt_for(
-        self,
-        execution: GymExecutionIdentity,
-        *,
-        agent_name: str,
-    ) -> GymCompletionReceipt:
-        """Fetch the exact Gym-issued receipt before publishing a completion."""
-        discovered = self._agent_checkpoint_participant(agent_name)
-        return GymCompletionReceipt.model_validate(
-            await self._control(
-                "GET",
-                GYM_AGENT_COMPLETION_RECEIPT_PATH,
-                server_name=discovered.participant.server_name,
-                params={
-                    "rollout_id": execution.rollout_id,
-                    "attempt_index": execution.attempt_index,
-                },
-            )
-        )
-
     async def acknowledge_completed_executions(
         self,
         executions: list[dict[str, Any]],
@@ -1092,17 +1107,62 @@ Depending on your data shape, you may want to change these values."""
         acknowledged: list[GymCompletedExecution] = []
         for agent_name, receipts in sorted(by_agent.items()):
             discovered = self._agent_checkpoint_participant(agent_name)
-            for receipt in receipts:
-                GymCompletedExecutionAcknowledgementResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        GYM_AGENT_COMPLETION_ACK_PATH,
-                        server_name=discovered.participant.server_name,
-                        json=receipt.model_dump(mode="json"),
+            use_bulk_ack = (
+                GYM_AGENT_COMPLETION_BULK_ACK_FEATURE
+                in discovered.capabilities.features
+            )
+            receipt_chunks = (
+                [
+                    receipts[
+                        offset : offset + GYM_AGENT_COMPLETION_BULK_ACK_MAX_RECEIPTS
+                    ]
+                    for offset in range(
+                        0,
+                        len(receipts),
+                        GYM_AGENT_COMPLETION_BULK_ACK_MAX_RECEIPTS,
                     )
-                )
-                acknowledged.append(
+                ]
+                if use_bulk_ack
+                else [[receipt] for receipt in receipts]
+            )
+            for receipt_chunk in receipt_chunks:
+                if use_bulk_ack:
+                    batch = GymCompletedExecutionAcknowledgementBatchRequest(
+                        receipts=receipt_chunk,
+                        batch_digest=gym_completion_acknowledgement_batch_digest(
+                            receipt_chunk
+                        ),
+                    )
+                    acknowledgement = GymCompletedExecutionAcknowledgementBatchResponse.model_validate(
+                        await self._control(
+                            "POST",
+                            GYM_AGENT_COMPLETION_BULK_ACK_PATH,
+                            server_name=discovered.participant.server_name,
+                            json=batch.model_dump(mode="json"),
+                        )
+                    )
+                    if acknowledgement.accepted_count != len(receipt_chunk):
+                        raise RuntimeError(
+                            "Gym bulk completion acknowledgement accepted an "
+                            "unexpected receipt count"
+                        )
+                    if acknowledgement.batch_digest != batch.batch_digest:
+                        raise RuntimeError(
+                            "Gym bulk completion acknowledgement returned a "
+                            "mismatched batch digest"
+                        )
+                else:
+                    GymCompletedExecutionAcknowledgementResponse.model_validate(
+                        await self._control(
+                            "POST",
+                            GYM_AGENT_COMPLETION_ACK_PATH,
+                            server_name=discovered.participant.server_name,
+                            json=receipt_chunk[0].model_dump(mode="json"),
+                        )
+                    )
+                acknowledged.extend(
                     GymCompletedExecution(receipt=receipt, agent_name=agent_name)
+                    for receipt in receipt_chunk
                 )
         return {"acknowledged": [item.model_dump(mode="json") for item in acknowledged]}
 
@@ -1451,24 +1511,21 @@ Depending on your data shape, you may want to change these values."""
         deadline_ts: float,
         checkpoint_dir: str,
     ) -> dict[str, Any]:
-        """Commit every stateful participant into a caller-owned temp directory."""
+        """Commit participants concurrently within dependency-ordered stages."""
         common_request = GymCheckpointDirectoryRequest(
             checkpoint_id=checkpoint_id,
             deadline_ts=deadline_ts,
             checkpoint_dir=checkpoint_dir,
         ).model_dump(mode="json")
-        results: list[GymParticipantCommitResult] = []
-        continuation_indexes: list[GymCheckpointArtifactReference] = []
-        for discovered in self._ordered_checkpoint_participants(
+        participants = self._ordered_checkpoint_participants(
             phase=_GymCheckpointPhase.COMMIT
-        ):
+        )
+        agents: list[GymDiscoveredParticipant] = []
+        models: list[GymDiscoveredParticipant] = []
+        resources: list[GymDiscoveredParticipant] = []
+        for discovered in participants:
             participant = discovered.participant
             capabilities = discovered.capabilities
-            payload: (
-                GymModelCommitResponse
-                | GymAgentCommitResponse
-                | GymResourcesCommitResponse
-            )
             if participant.component == "responses_api_models":
                 if (
                     GYM_EXTERNAL_STORAGE_REFERENCE_INDEX_FEATURE
@@ -1478,67 +1535,122 @@ Depending on your data shape, you may want to change these values."""
                         "Gym policy model does not support external-storage "
                         "reference indexes"
                     )
-                request = GymModelCheckpointCommitRequest(
-                    checkpoint_id=checkpoint_id,
-                    deadline_ts=deadline_ts,
-                    checkpoint_dir=checkpoint_dir,
-                    continuation_indexes=continuation_indexes,
-                ).model_dump(mode="json")
-                payload = GymModelCommitResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{GYM_MODEL_CHECKPOINT_PREFIX}/commit",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
-                )
+                models.append(discovered)
             elif participant.component == "responses_api_agents":
                 if GYM_AGENT_CONTINUATION_INDEX_FEATURE not in capabilities.features:
                     raise RuntimeError(
                         "Gym agent does not support continuation indexes"
                     )
-                request = GymAgentCheckpointDirectoryRequest(
-                    checkpoint_id=checkpoint_id,
-                    deadline_ts=deadline_ts,
-                    checkpoint_dir=checkpoint_dir,
-                ).model_dump(mode="json")
-                payload = GymAgentCommitResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{GYM_AGENT_CHECKPOINT_PREFIX}/commit",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
-                )
-                continuation_indexes.append(payload.continuation_index)
+                agents.append(discovered)
             else:
-                request = common_request
-                payload = GymResourcesCommitResponse.model_validate(
-                    await self._control(
-                        "POST",
-                        f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/commit",
-                        server_name=participant.server_name,
-                        timeout_s=self._checkpoint_request_timeout(deadline_ts),
-                        json=request,
-                    )
-                )
+                resources.append(discovered)
+
+        def commit_result(
+            discovered: GymDiscoveredParticipant,
+            payload: (
+                GymModelCommitResponse
+                | GymAgentCommitResponse
+                | GymResourcesCommitResponse
+            ),
+        ) -> GymParticipantCommitResult:
+            participant = discovered.participant
             manifest = GymParticipantManifestReference(
                 participant=participant,
                 relative_path=self._participant_checkpoint_path(participant),
                 manifest_digest=payload.manifest_digest,
             )
-            results.append(
-                GymParticipantCommitResult(
-                    participant=participant,
-                    payload=payload,
-                    manifest=manifest,
+            return GymParticipantCommitResult(
+                participant=participant,
+                payload=payload,
+                manifest=manifest,
+            )
+
+        async def commit_agent(
+            discovered: GymDiscoveredParticipant,
+        ) -> GymParticipantCommitResult:
+            participant = discovered.participant
+            request = GymAgentCheckpointDirectoryRequest(
+                checkpoint_id=checkpoint_id,
+                deadline_ts=deadline_ts,
+                checkpoint_dir=checkpoint_dir,
+            ).model_dump(mode="json")
+            payload = GymAgentCommitResponse.model_validate(
+                await self._control(
+                    "POST",
+                    f"{GYM_AGENT_CHECKPOINT_PREFIX}/commit",
+                    server_name=participant.server_name,
+                    timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                    json=request,
                 )
             )
+            return commit_result(discovered, payload)
+
+        async def commit_model(
+            discovered: GymDiscoveredParticipant,
+            continuation_indexes: list[GymCheckpointArtifactReference],
+        ) -> GymParticipantCommitResult:
+            participant = discovered.participant
+            request = GymModelCheckpointCommitRequest(
+                checkpoint_id=checkpoint_id,
+                deadline_ts=deadline_ts,
+                checkpoint_dir=checkpoint_dir,
+                continuation_indexes=continuation_indexes,
+            ).model_dump(mode="json")
+            payload = GymModelCommitResponse.model_validate(
+                await self._control(
+                    "POST",
+                    f"{GYM_MODEL_CHECKPOINT_PREFIX}/commit",
+                    server_name=participant.server_name,
+                    timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                    json=request,
+                )
+            )
+            return commit_result(discovered, payload)
+
+        async def commit_resources(
+            discovered: GymDiscoveredParticipant,
+        ) -> GymParticipantCommitResult:
+            participant = discovered.participant
+            payload = GymResourcesCommitResponse.model_validate(
+                await self._control(
+                    "POST",
+                    f"{GYM_RESOURCES_CHECKPOINT_PREFIX}/commit",
+                    server_name=participant.server_name,
+                    timeout_s=self._checkpoint_request_timeout(deadline_ts),
+                    json=common_request,
+                )
+            )
+            return commit_result(discovered, payload)
+
+        async def commit_stage(
+            operations: list[Coroutine[Any, Any, GymParticipantCommitResult]],
+        ) -> list[GymParticipantCommitResult]:
+            tasks = [asyncio.create_task(operation) for operation in operations]
+            try:
+                return list(await asyncio.gather(*tasks))
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+        agent_results = await commit_stage(
+            [commit_agent(discovered) for discovered in agents]
+        )
+        continuation_indexes = [
+            GymAgentCommitResponse.model_validate(result.payload).continuation_index
+            for result in agent_results
+        ]
+        model_results = await commit_stage(
+            [commit_model(discovered, continuation_indexes) for discovered in models]
+        )
+        resource_results = await commit_stage(
+            [commit_resources(discovered) for discovered in resources]
+        )
         return GymCheckpointCommitResult(
             checkpoint_id=checkpoint_id,
-            participants=results,
+            participants=agent_results + model_results + resource_results,
         ).model_dump(mode="json")
 
     async def restore_checkpoint(
@@ -1924,7 +2036,7 @@ Depending on your data shape, you may want to change these values."""
 
         timer = Timer()
         timer.start("_run_rollouts_total")
-        nemo_gym_result_iterator = self.rch.run_examples(
+        nemo_gym_result_iterator = self.rch.run_examples_with_metadata(
             examples=nemo_gym_examples, head_server_config=self.head_server_config
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
@@ -1938,7 +2050,18 @@ Depending on your data shape, you may want to change these values."""
         for task in nemo_gym_result_iterator:
             with timer.time(label=f"{timer_prefix}/await_results"):
                 try:
-                    nemo_gym_row, nemo_gym_result = await task
+                    completed = await task
+                    if len(completed) != 3:
+                        raise RuntimeError(
+                            "NeMo-Gym metadata-aware rollout result must contain "
+                            "exactly (row, result, metadata)"
+                        )
+                    nemo_gym_row, nemo_gym_result, rollout_metadata = completed
+                    if not isinstance(rollout_metadata, Mapping):
+                        raise TypeError(
+                            "NeMo-Gym metadata-aware rollout result metadata must "
+                            "be a mapping"
+                        )
                 except Exception as error:
                     if hasattr(error, "response_content"):
                         print(
@@ -1969,10 +2092,38 @@ Depending on your data shape, you may want to change these values."""
                 completion_receipt = None
                 if self._gym_checkpoint_participants:
                     assert execution is not None
-                    completion_receipt = await self._completion_receipt_for(
-                        execution,
-                        agent_name=nemo_gym_row["agent_ref"]["name"],
+                    agent_name = nemo_gym_row["agent_ref"]["name"]
+                    raw_inline_receipt = rollout_metadata.get("completion_receipt")
+                    discovered = self._agent_checkpoint_participant(agent_name)
+                    if (
+                        GYM_AGENT_INLINE_COMPLETION_RECEIPT_FEATURE
+                        not in discovered.capabilities.features
+                    ):
+                        raise RuntimeError(
+                            f"Gym agent {agent_name!r} does not advertise the "
+                            "required inline completion-receipt feature"
+                        )
+                    if raw_inline_receipt is None:
+                        raise RuntimeError(
+                            f"Gym agent {agent_name!r} completed execution "
+                            f"({execution.rollout_id!r}, {execution.attempt_index}) "
+                            "without returning the required inline completion receipt"
+                        )
+                    completion_receipt = GymCompletionReceipt.model_validate(
+                        raw_inline_receipt
                     )
+                    if (
+                        completion_receipt.rollout_id != execution.rollout_id
+                        or completion_receipt.attempt_index != execution.attempt_index
+                    ):
+                        raise RuntimeError(
+                            "inline Gym completion receipt identity does not match "
+                            "the completed execution: "
+                            f"expected=({execution.rollout_id!r}, "
+                            f"{execution.attempt_index}), "
+                            f"actual=({completion_receipt.rollout_id!r}, "
+                            f"{completion_receipt.attempt_index})"
+                        )
                 if self._token_capture_enabled:
                     # Receipt mode: fetch the ledger manifest and assemble the
                     # receipt locally; token-free result. The canonical row is

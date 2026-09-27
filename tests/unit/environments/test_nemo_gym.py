@@ -95,13 +95,13 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
         ]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples_with_metadata(self, examples, head_server_config):
                 del head_server_config
                 for row in examples:
                     row["agent_ref"] = {"name": "resolved_agent"}
 
                 async def _completed_result(row):
-                    return row, {"response": {"output": []}}
+                    return row, {"response": {"output": []}}, {}
 
                 return [_completed_result(row) for row in examples]
 
@@ -165,13 +165,25 @@ def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() 
         }
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples_with_metadata(self, examples, head_server_config):
                 del head_server_config
                 dispatch_started.set()
 
                 async def _completed_result():
                     await complete_rollout.wait()
-                    return examples[0], {"response": {"output": []}}
+                    return (
+                        examples[0],
+                        {"response": {"output": []}},
+                        {
+                            "completion_receipt": GymCompletionReceipt(
+                                rollout_id="group-1_g0",
+                                attempt_index=0,
+                                execution_generation=1,
+                                result_identity="result-group-1_g0-0",
+                                result_digest="1" * 64,
+                            ).model_dump(mode="json")
+                        },
+                    )
 
                 return [_completed_result()]
 
@@ -188,15 +200,12 @@ def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() 
             def _require_spinup(self):
                 pass
 
-            async def _completion_receipt_for(self, execution, *, agent_name):
-                assert execution.rollout_id == "group-1_g0"
+            def _agent_checkpoint_participant(self, agent_name):
                 assert agent_name == "test-agent"
-                return GymCompletionReceipt(
-                    rollout_id="group-1_g0",
-                    attempt_index=0,
-                    execution_generation=1,
-                    result_identity="result-group-1_g0-0",
-                    result_digest="1" * 64,
+                return SimpleNamespace(
+                    capabilities=SimpleNamespace(
+                        features=["completion_receipt_in_run_response_v1"]
+                    )
                 )
 
             def _postprocess_nemo_gym_to_nemo_rl_result(
@@ -236,6 +245,95 @@ def test_run_rollouts_waits_when_checkpoint_freezes_before_actor_registration() 
         await stream.aclose()
         registry.unfreeze("snapshot-2")
         assert registry.status()["live"] == 0
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("include_receipt", [True, False])
+def test_run_rollouts_requires_inline_completion_receipt(
+    include_receipt: bool,
+) -> None:
+    async def _run() -> None:
+        row = {
+            "_rowidx": 0,
+            "_ng_rollout_id": "group-1_g0",
+            "_ng_attempt_index": 0,
+            "agent_ref": {"name": "test-agent"},
+            "responses_create_params": {"input": []},
+        }
+        receipt = GymCompletionReceipt(
+            rollout_id="group-1_g0",
+            attempt_index=0,
+            execution_generation=1,
+            result_identity="result-group-1_g0-0",
+            result_digest="1" * 64,
+        ).model_dump(mode="json")
+
+        class _RolloutCollectionHelper:
+            def run_examples_with_metadata(self, examples, head_server_config):
+                del head_server_config
+
+                async def _completed_result():
+                    return (
+                        examples[0],
+                        {"response": {"output": []}},
+                        {"completion_receipt": receipt if include_receipt else None},
+                    )
+
+                return [_completed_result()]
+
+        class _MockSelf:
+            cfg = {}
+            rch = _RolloutCollectionHelper()
+            head_server_config = object()
+            _token_capture_enabled = False
+            _stable_execution_identity_enabled = True
+            _gym_checkpoint_participants = (object(),)
+            _gym_execution_registry = GymActorExecutionRegistry()
+            _tokenizer = object()
+
+            def _require_spinup(self):
+                pass
+
+            def _agent_checkpoint_participant(self, agent_name):
+                assert agent_name == "test-agent"
+                return SimpleNamespace(
+                    capabilities=SimpleNamespace(
+                        features=["completion_receipt_in_run_response_v1"]
+                    )
+                )
+
+            def _postprocess_nemo_gym_to_nemo_rl_result(
+                self,
+                result_row,
+                result,
+                result_tokenizer,
+                *,
+                include_initial_multimodal_data,
+            ):
+                del (
+                    self,
+                    result_row,
+                    result,
+                    result_tokenizer,
+                    include_initial_multimodal_data,
+                )
+                return {"message_log": []}
+
+        stream = NemoGym.__ray_metadata__.modified_class.run_rollouts(
+            _MockSelf(), [row], "test"
+        )
+        if not include_receipt:
+            with pytest.raises(
+                RuntimeError, match="required inline completion receipt"
+            ):
+                await anext(stream)
+            return
+
+        results = [item async for item in stream]
+
+        assert len(results) == 1
+        assert results[0][2]["gym_completion_receipt"] == receipt
 
     asyncio.run(_run())
 
@@ -1717,14 +1815,14 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         postprocess_calls = []
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples_with_metadata(self, examples, head_server_config):
                 del head_server_config
                 content = examples[0]["responses_create_params"]["input"][0]["content"]
                 assert content[0]["video_url"].startswith("data:video/mp4;base64,")
                 assert content[1]["image_url"].startswith("data:image/png;base64,")
 
                 async def _completed_result():
-                    return nemo_gym_row, nemo_gym_result
+                    return nemo_gym_row, nemo_gym_result, {}
 
                 return [_completed_result()]
 
@@ -1782,14 +1880,14 @@ def test_nemo_gym_run_rollouts_drains_siblings_after_one_task_fails():
         completed_row = {"_rowidx": 1, "agent_ref": {"name": "agent"}}
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples_with_metadata(self, examples, head_server_config):
                 del examples, head_server_config
 
                 async def _failed_result():
                     raise ConnectionResetError("row zero failed")
 
                 async def _completed_result():
-                    return completed_row, {"response": {"output": []}}
+                    return completed_row, {"response": {"output": []}}, {}
 
                 return [_failed_result(), _completed_result()]
 
@@ -1858,7 +1956,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
                 return [" ".join(map(str, token_ids)) for token_ids in batches]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples_with_metadata(self, examples, head_server_config):
                 assert head_server_config.backend == "megatron"
                 dispatched_row = examples[0]
                 dispatched_part = dispatched_row["responses_create_params"]["input"][0][
@@ -1889,7 +1987,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
                 }
 
                 async def _completed_result():
-                    return dispatched_row, mocked_result
+                    return dispatched_row, mocked_result, {}
 
                 return [_completed_result()]
 
