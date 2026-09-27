@@ -699,7 +699,7 @@ class GymAgentDiscardRestoredContinuationResponse(_StrictWireModel):
 
 
 class GymModelCheckpointCommitRequest(GymCheckpointDirectoryRequest):
-    """Model commit request scoped to agent-owned continuation roots."""
+    """Model commit request joining continuation and peer generation-cut indexes."""
 
     continuation_indexes: list[GymCheckpointArtifactReference]
     generation_cut_indexes: list[GymCheckpointArtifactReference] = Field(

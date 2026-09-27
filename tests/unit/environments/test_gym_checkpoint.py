@@ -121,7 +121,11 @@ def test_checkpoint_requests_use_required_new_only_artifact_contract() -> None:
     assert GymModelCheckpointCommitRequest(
         **common,
         continuation_indexes=[],
-    ).model_dump() == {**expected_common, "continuation_indexes": []}
+    ).model_dump() == {
+        **expected_common,
+        "continuation_indexes": [],
+        "generation_cut_indexes": [],
+    }
 
     with pytest.raises(ValidationError, match="continuation_indexes"):
         GymModelCheckpointCommitRequest(**common)
